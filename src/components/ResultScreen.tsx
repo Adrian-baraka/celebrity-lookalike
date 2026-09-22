@@ -87,6 +87,9 @@ export default function ResultScreen({
             <span className="h-2 w-2 rounded-full bg-emerald-400" />
             {result.similarity}% LOOK-ALIKE
           </div>
+          <p className="mt-2 text-[11px] font-bold tracking-[0.18em] text-zinc-400">
+            {result.source === "fallback" ? "OFFLINE GAME MATCH • JUST FOR FUN" : "VISUAL MATCH • JUST FOR FUN"}
+          </p>
 
           <p className="mx-auto mt-4 max-w-md text-sm leading-6 text-zinc-600">
             {result.celebrity.description} <span className="font-semibold text-zinc-900">{result.description}</span>

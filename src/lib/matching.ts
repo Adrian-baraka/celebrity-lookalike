@@ -2,19 +2,23 @@ import type { Gender, MatchResult, Celebrity } from "@/types";
 import { getCelebritiesByGender } from "@/data/celebrities";
 
 /**
- * Real visual look-alike matching — local/on-device, privacy-preserving.
- *
- * Signature preserved: export async function analyzeFace(imageDataUrl: string, gender: Gender): Promise<MatchResult>
+ * Real AI look-alike matching — server-side vision model is the primary path.
  *
  * Pipeline:
- *  student dataUrl → HTMLImageElement (center-crop 32x32 thumbnail + 24-bin histogram)
- *  → normalized features
- *  → load/cache celebrity features for selected gender (in-memory only, per session)
- *  → cosine/Euclidean distance against each candidate in filtered pool
- *  → rank → best match → distance → game-style VISUAL MATCH % (70-96, not biometric)
+ *  analyzeFace(image, gender)
+ *    → POST /api/match (student dataUrl + gender only; server resolves candidates)
+ *    → server reads gender-filtered celebrity images from public/celebrities/
+ *    → student image + candidate images reach the vision model together
+ *    → model returns a celebrityId constrained to the allowed set
+ *    → server + client validate the ID against src/data/celebrities.ts
+ *    → MatchResult { source: "ai" }
  *
- * No external API, no persistent storage, no student profile retained beyond return.
- * Celebrity features cached in memory for Club Fair performance; student features discarded after call.
+ * If AI is unavailable/misconfigured/invalid, a clearly-marked local visual
+ * fallback (thumbnail + color-histogram comparison, same gender pool) is used
+ * and returned as { source: "fallback" } — never claimed as AI.
+ *
+ * No student photo, embedding, or profile is persisted anywhere.
+ * Celebrity thumbnail features below are cached in memory only (per page load).
  */
 
 type Features = {
@@ -24,6 +28,7 @@ type Features = {
 
 const THUMB_SIZE = 32;
 const HIST_BINS = 8;
+const AI_TIMEOUT_MS = 45000;
 
 // In-memory cache only — cleared on page reload, never persisted
 const celebCache = new Map<Gender, Map<string, Features>>();
@@ -180,15 +185,14 @@ async function ensureCelebFeatures(gender: Gender): Promise<Map<string, Features
   return celebCache.get(gender)!;
 }
 
-export async function analyzeFace(
+/**
+ * Local visual comparison — FALLBACK ONLY. Never presented as AI.
+ * Same gender-filtered pool, same dataset validation as the AI path.
+ */
+async function localVisualMatch(
   imageDataUrl: string,
   gender: Gender
 ): Promise<MatchResult> {
-  if (typeof document === "undefined") throw new Error("Matching only runs in the browser. Please try again.");
-  if (!imageDataUrl || !imageDataUrl.startsWith("data:image")) {
-    throw new Error("We couldn't read that photo. Please retake or upload a valid image.");
-  }
-
   // Timeout guard — 10s for full flow (student + 28 candidates)
   const timeout = new Promise<never>((_, rej) =>
     setTimeout(() => rej(new Error("Matching took too long. Please retake with good lighting and try again.")), 10000)
@@ -216,13 +220,11 @@ export async function analyzeFace(
     // 3. Compare against all candidates in selected gender pool only
     let best: Celebrity | null = null;
     let bestDist = Infinity;
-    const scored: { cel: Celebrity; dist: number }[] = [];
 
     for (const cel of pool) {
       const cf = cache.get(cel.id);
       if (!cf) continue; // skip failed loads
       const d = distance(studentFeat, cf);
-      scored.push({ cel, dist: d });
       if (d < bestDist) {
         bestDist = d;
         best = cel;
@@ -231,21 +233,126 @@ export async function analyzeFace(
 
     if (!best) throw new Error("Matching failed. Please retake your photo.");
 
-    // Optional: handle extreme poor quality (all distances very high)
-    if (bestDist > 1.45) {
-      // Still return best but lower similarity; don't block, just allow retake hint via similarity
-    }
-
     const similarity = distanceToSimilarity(bestDist);
 
     return {
       celebrity: best,
       similarity,
       description: "Your strongest match is based on playful visual comparison against the selected group — not identity recognition. Just for fun!",
+      source: "fallback",
     };
   })();
 
   return Promise.race([work, timeout]);
+}
+
+/** Downscale the student photo before upload to keep the AI request small. */
+function downscaleDataUrl(dataUrl: string, maxSide = 768): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(dataUrl);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", 0.8));
+      } catch (e) {
+        reject(e instanceof Error ? e : new Error("Could not prepare photo."));
+      }
+    };
+    img.onerror = () => reject(new Error("We couldn't read that photo. Please retake or upload a valid image."));
+    img.src = dataUrl;
+  });
+}
+
+interface AiMatchResponse {
+  celebrityId: string;
+  similarity: number;
+  source: "ai";
+}
+
+/** Primary path: genuine server-side AI visual match. Throws when unusable. */
+async function tryAiMatch(
+  imageDataUrl: string,
+  gender: Gender
+): Promise<MatchResult> {
+  const prepared = await downscaleDataUrl(imageDataUrl);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch("/api/match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageDataUrl: prepared, gender }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    throw new Error(
+      e instanceof DOMException && e.name === "AbortError"
+        ? "AI matching timed out."
+        : "AI matching is unreachable."
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) throw new Error(`AI match failed (${res.status}).`);
+
+  const data = (await res.json()) as Partial<AiMatchResponse>;
+  if (!data || data.source !== "ai" || typeof data.celebrityId !== "string") {
+    throw new Error("Invalid AI response.");
+  }
+
+  // Client-side re-validation: ID must exist in the gender-filtered dataset.
+  const pool = getCelebritiesByGender(gender);
+  const celebrity = pool.find((c) => c.id === data.celebrityId) ?? null;
+  if (!celebrity) throw new Error("Invalid AI celebrity.");
+
+  const similarity =
+    typeof data.similarity === "number" && Number.isFinite(data.similarity)
+      ? Math.max(70, Math.min(96, Math.round(data.similarity)))
+      : 85;
+
+  return {
+    celebrity,
+    similarity,
+    description: "Picked by visual AI comparison against the selected group — a fun resemblance game, not identity recognition!",
+    source: "ai",
+  };
+}
+
+export async function analyzeFace(
+  imageDataUrl: string,
+  gender: Gender
+): Promise<MatchResult> {
+  if (typeof document === "undefined") throw new Error("Matching only runs in the browser. Please try again.");
+  if (!imageDataUrl || !imageDataUrl.startsWith("data:image")) {
+    throw new Error("We couldn't read that photo. Please retake or upload a valid image.");
+  }
+  if (gender !== "male" && gender !== "female") {
+    throw new Error("Please choose a match pool first.");
+  }
+
+  // Primary path: real server-side AI visual matching.
+  try {
+    return await tryAiMatch(imageDataUrl, gender);
+  } catch (e) {
+    console.info("[matching] AI path unavailable, using local fallback:", e instanceof Error ? e.message : e);
+  }
+
+  // Clearly-marked fallback — never claimed as AI (source: "fallback").
+  return localVisualMatch(imageDataUrl, gender);
 }
 
 // Exposed for testing/clearing between players if needed (not persisted)

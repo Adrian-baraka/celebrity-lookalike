@@ -21,4 +21,6 @@ export interface MatchResult {
   celebrity: Celebrity;
   similarity: number; // 70-99
   description: string;
+  /** "ai" = genuine server-side AI visual match; "fallback" = local visual comparison (not AI). */
+  source?: "ai" | "fallback";
 }

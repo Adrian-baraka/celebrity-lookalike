@@ -181,7 +181,7 @@ export default function CameraCapture({
           </div>
         </div>
 
-        <p className="mt-6 text-center text-[11px] leading-4 text-white/45">🔒 Photo stays on this device for this round only. Not saved.</p>
+        <p className="mt-6 text-center text-[11px] leading-4 text-white/45">🔒 Photo is used temporarily for your match and not saved.</p>
       </div>
     </div>
   );
